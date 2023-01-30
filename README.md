@@ -22,3 +22,7 @@
 
 # OLED Image
  If you want to replace the BarrKeeb16_screenlogo bitmap, create any black and white 128x64 pixel image and rename as 'BarrKeeb16_screenlogo.bmp' or 'BarrKeeb16_screenlogo_inverted.bmp' or modify the image filename in [display_logo.py](https://github.com/masterkrieger/BarrKeeb16/blob/main/Firmware/display_logo.py).
+
+## TODO:
+- Update STL models with new OLED position (v1.2).
+- Update FIRMWARE with new RP2040 and IO Expander pinouts (v1.2).
