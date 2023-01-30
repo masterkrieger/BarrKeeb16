@@ -1,5 +1,8 @@
 # BarrKeeb16
  This is a 16 key macro keypad with a rotary encoder, OLED display and under-glow RGB. BarrKeeb16 is running KMK firmware on the Seeed XIAO RP2040.
+ 
+![BarrKeeb16_1](https://user-images.githubusercontent.com/1848365/215525772-2e19a67b-24e5-490f-b6b9-0f2c315ed285.jpg)
+![BarrKeeb16_2](https://user-images.githubusercontent.com/1848365/215525108-cd2773e8-b6eb-42d3-a489-ce489db9ac39.jpg)
 
 # Parts
 1. BarrKeeb16 custom PCB. [JLCPCB](https://jlcpcb.com/)
