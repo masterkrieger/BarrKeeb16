@@ -1,5 +1,5 @@
 from kmk.extensions import Extension
-from kmk.keys import make_consumer_key
+from kmk.keys import ConsumerKey, make_key
 
 
 class MediaKeys(Extension):
@@ -14,18 +14,24 @@ class MediaKeys(Extension):
         # support PC media keys, so I don't know how much value we would get out of
         # adding the old Apple-specific consumer codes, but again, PRs welcome if the
         # lack of them impacts you.
-        make_consumer_key(code=226, names=('AUDIO_MUTE', 'MUTE'))  # 0xE2
-        make_consumer_key(code=233, names=('AUDIO_VOL_UP', 'VOLU'))  # 0xE9
-        make_consumer_key(code=234, names=('AUDIO_VOL_DOWN', 'VOLD'))  # 0xEA
-        make_consumer_key(code=181, names=('MEDIA_NEXT_TRACK', 'MNXT'))  # 0xB5
-        make_consumer_key(code=182, names=('MEDIA_PREV_TRACK', 'MPRV'))  # 0xB6
-        make_consumer_key(code=183, names=('MEDIA_STOP', 'MSTP'))  # 0xB7
-        make_consumer_key(
-            code=205, names=('MEDIA_PLAY_PAUSE', 'MPLY')
-        )  # 0xCD (this may not be right)
-        make_consumer_key(code=184, names=('MEDIA_EJECT', 'EJCT'))  # 0xB8
-        make_consumer_key(code=179, names=('MEDIA_FAST_FORWARD', 'MFFD'))  # 0xB3
-        make_consumer_key(code=180, names=('MEDIA_REWIND', 'MRWD'))  # 0xB4
+
+        codes = (
+            (0xE2, ('AUDIO_MUTE', 'MUTE')),
+            (0xE9, ('AUDIO_VOL_UP', 'VOLU')),
+            (0xEA, ('AUDIO_VOL_DOWN', 'VOLD')),
+            (0x6F, ('BRIGHTNESS_UP', 'BRIU')),
+            (0x70, ('BRIGHTNESS_DOWN', 'BRID')),
+            (0xB5, ('MEDIA_NEXT_TRACK', 'MNXT')),
+            (0xB6, ('MEDIA_PREV_TRACK', 'MPRV')),
+            (0xB7, ('MEDIA_STOP', 'MSTP')),
+            (0xCD, ('MEDIA_PLAY_PAUSE', 'MPLY')),
+            (0xB8, ('MEDIA_EJECT', 'EJCT')),
+            (0xB3, ('MEDIA_FAST_FORWARD', 'MFFD')),
+            (0xB4, ('MEDIA_REWIND', 'MRWD')),
+        )
+
+        for code, names in codes:
+            make_key(names=names, constructor=ConsumerKey, code=code)
 
     def on_runtime_enable(self, sandbox):
         return

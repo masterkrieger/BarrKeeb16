@@ -1,9 +1,30 @@
-from supervisor import ticks_ms
+try:
+    from typing import Callable, Optional
+except ImportError:
+    pass
 
-from kmk.consts import KMK_RELEASE, UnicodeMode
+from collections import namedtuple
+from keypad import Event as KeyEvent
+
 from kmk.hid import BLEHID, USBHID, AbstractHID, HIDModes
-from kmk.keys import KC
-from kmk.matrix import MatrixScanner, intify_coordinate
+from kmk.keys import KC, Axis, Key
+from kmk.modules import Module
+from kmk.scanners.keypad import MatrixScanner
+from kmk.scheduler import Task, cancel_task, create_task, get_due_task
+from kmk.utils import Debug
+
+debug = Debug('kmk.keyboard')
+
+KeyBufferFrame = namedtuple(
+    'KeyBufferFrame', ('key', 'is_pressed', 'int_coord', 'index')
+)
+
+
+def debug_error(module, message: str, error: Exception):
+    if debug.enabled:
+        debug(
+            message, ': ', error.__class__.__name__, ': ', error, name=module.__module__
+        )
 
 
 class Sandbox:
@@ -13,234 +34,225 @@ class Sandbox:
 
 
 class KMKKeyboard:
-    #####
-    # User-configurable
-    debug_enabled = False
+    def __init__(self) -> None:
+        #####
+        # User-configurable
+        self.keymap = []
+        self.coord_mapping = None
 
-    keymap = []
-    coord_mapping = None
+        self.row_pins = None
+        self.col_pins = None
+        self.diode_orientation = None
+        self.matrix = None
 
-    row_pins = None
-    col_pins = None
-    diode_orientation = None
-    matrix = None
-    matrix_scanner = MatrixScanner
-    uart_buffer = []
+        self.modules = []
+        self.extensions = []
+        self.sandbox = Sandbox()
 
-    unicode_mode = UnicodeMode.NOOP
+        #####
+        # Internal State
+        self.keys_pressed = set()
+        self._coordkeys_pressed = {}
+        self.implicit_modifier = None
+        self.hid_type = HIDModes.USB
+        self.secondary_hid_type = None
+        self._hid_helper = None
+        self._hid_send_enabled = False
+        self.hid_pending = False
+        self.matrix_update = None
+        self.secondary_matrix_update = None
+        self.matrix_update_queue = []
+        self._trigger_powersave_enable = False
+        self._trigger_powersave_disable = False
+        self._go_args = None
+        self._resume_buffer = []
+        self._resume_buffer_x = []
 
-    modules = []
-    extensions = []
-    sandbox = Sandbox()
+        # this should almost always be PREpended to, replaces
+        # former use of reversed_active_layers which had pointless
+        # overhead (the underlying list was never used anyway)
+        self.active_layers = [0]
 
-    #####
-    # Internal State
-    keys_pressed = set()
-    _coordkeys_pressed = {}
-    hid_type = HIDModes.USB
-    secondary_hid_type = None
-    _hid_helper = None
-    hid_pending = False
-    current_key = None
-    matrix_update = None
-    secondary_matrix_update = None
-    _matrix_modify = None
-    state_changed = False
-    _old_timeouts_len = None
-    _new_timeouts_len = None
-    _trigger_powersave_enable = False
-    _trigger_powersave_disable = False
-    i2c_deinit_count = 0
-    _go_args = None
+    def __repr__(self) -> str:
+        return self.__class__.__name__
 
-    # this should almost always be PREpended to, replaces
-    # former use of reversed_active_layers which had pointless
-    # overhead (the underlying list was never used anyway)
-    active_layers = [0]
+    def _send_hid(self) -> None:
+        if not self._hid_send_enabled:
+            return
 
-    _timeouts = {}
+        if debug.enabled:
+            if self.keys_pressed:
+                debug('keys_pressed=', self.keys_pressed)
 
-    # on some M4 setups (such as klardotsh/klarank_feather_m4, CircuitPython
-    # 6.0rc1) this runs out of RAM every cycle and takes down the board. no
-    # real known fix yet other than turning off debug, but M4s have always been
-    # tight on RAM so....
-    def __repr__(self):
-        return (
-            'KMKKeyboard('
-            'debug_enabled={} '
-            'diode_orientation={} '
-            'matrix_scanner={} '
-            'unicode_mode={} '
-            '_hid_helper={} '
-            'keys_pressed={} '
-            'coordkeys_pressed={} '
-            'hid_pending={} '
-            'active_layers={} '
-            'timeouts={} '
-            ')'
-        ).format(
-            self.debug_enabled,
-            self.diode_orientation,
-            self.matrix_scanner,
-            self.unicode_mode,
-            self._hid_helper,
-            # internal state
-            self.keys_pressed,
-            self._coordkeys_pressed,
-            self.hid_pending,
-            self.active_layers,
-            self._timeouts,
-        )
+        self._hid_helper.create_report(self.keys_pressed)
+        try:
+            self._hid_helper.send()
+        except Exception as err:
+            debug_error(self._hid_helper, 'send', err)
 
-    def _print_debug_cycle(self, init=False):
-        if self.debug_enabled:
-            if init:
-                print('KMKInit(release={})'.format(KMK_RELEASE))
-            print(self)
-
-    def _send_hid(self):
-        self._hid_helper.create_report(self.keys_pressed).send()
         self.hid_pending = False
 
-    def _handle_matrix_report(self, update=None):
-        if update is not None:
-            self._on_matrix_changed(update[0], update[1], update[2])
-            self.state_changed = True
+        for key in self.keys_pressed:
+            if isinstance(key, Axis):
+                key.move(self, 0)
 
-    def _find_key_in_map(self, int_coord, row, col):
+    def _handle_matrix_report(self, kevent: KeyEvent) -> None:
+        if kevent is not None:
+            self._on_matrix_changed(kevent)
+
+    def _find_key_in_map(self, int_coord: int) -> Key:
         try:
             idx = self.coord_mapping.index(int_coord)
         except ValueError:
-            if self.debug_enabled:
-                print(
-                    'CoordMappingNotFound(ic={}, row={}, col={})'.format(
-                        int_coord, row, col
-                    )
-                )
-
+            if debug.enabled:
+                debug('no such int_coord: ', int_coord)
             return None
 
+        key = None
         for layer in self.active_layers:
             try:
-                layer_key = self.keymap[layer][idx]
+                key = self.keymap[layer][idx]
             except IndexError:
-                layer_key = None
-                if self.debug_enabled:
-                    print(f'KeymapIndexError(idx={idx}, layer={layer})')
+                if debug.enabled:
+                    debug('keymap IndexError: idx=', idx, ' layer=', layer)
 
-            if not layer_key or layer_key == KC.TRNS:
-                continue
+            if key and key != KC.TRNS:
+                break
 
-            if self.debug_enabled:
-                print('KeyResolution(key={})'.format(layer_key))
+        return key
 
-            return layer_key
+    def _on_matrix_changed(self, kevent: KeyEvent) -> None:
+        int_coord = kevent.key_number
+        is_pressed = kevent.pressed
+        key = None
 
-    def _on_matrix_changed(self, row, col, is_pressed):
-        if self.debug_enabled:
-            print('MatrixChange(col={} row={} pressed={})'.format(col, row, is_pressed))
-
-        int_coord = intify_coordinate(row, col)
         if not is_pressed:
-            self.current_key = self._coordkeys_pressed[int_coord]
-            if self.debug_enabled:
-                print('PressedKeyResolution(key={})'.format(self.current_key))
+            key = self._coordkeys_pressed.pop(int_coord, None)
 
-        if self.current_key is None:
-            self.current_key = self._find_key_in_map(int_coord, row, col)
+        if key is None:
+            key = self._find_key_in_map(int_coord)
 
-        if is_pressed:
-            self._coordkeys_pressed[int_coord] = self.current_key
-        else:
-            self._coordkeys_pressed[int_coord] = None
+        if key is None:
+            return
 
-        if self.current_key is None:
-            print('MatrixUndefinedCoordinate(col={} row={})'.format(col, row))
-            return self
+        if debug.enabled:
+            debug(kevent, ': ', key)
 
-        for module in self.modules:
+        self.pre_process_key(key, is_pressed, int_coord)
+
+    def _process_resume_buffer(self):
+        '''
+        Resume the processing of buffered, delayed, deferred, etc. key events
+        emitted by modules.
+
+        We use a copy of the `_resume_buffer` as a working buffer. The working
+        buffer holds all key events in the correct order for processing. If
+        during processing new events are pushed to the `_resume_buffer`, they
+        are prepended to the working buffer (which may not be emptied), in
+        order to preserve key event order.
+        We also double-buffer `_resume_buffer` with `_resume_buffer_x`, only
+        copying the reference to hopefully safe some time on allocations.
+        '''
+
+        buffer, self._resume_buffer = self._resume_buffer, self._resume_buffer_x
+
+        while buffer:
+            ksf = buffer.pop(0)
+            key = ksf.key
+
+            # Handle any unaccounted-for layer shifts by looking up the key resolution again.
+            if ksf.int_coord is not None:
+                if ksf.is_pressed:
+                    key = self._find_key_in_map(ksf.int_coord)
+                else:
+                    key = self._coordkeys_pressed.pop(ksf.int_coord, key)
+
+            # Resume the processing of the key event and update the HID report
+            # when applicable.
+            self.pre_process_key(key, ksf.is_pressed, ksf.int_coord, ksf.index)
+
+            if self.hid_pending:
+                self._send_hid()
+                self.hid_pending = False
+
+            # Any newly buffered key events must be prepended to the working
+            # buffer.
+            if self._resume_buffer:
+                self._resume_buffer.extend(buffer)
+                buffer.clear()
+                buffer, self._resume_buffer = self._resume_buffer, buffer
+
+        self._resume_buffer_x = buffer
+
+    def pre_process_key(
+        self,
+        key: Key,
+        is_pressed: bool,
+        int_coord: Optional[int] = None,
+        index: int = 0,
+    ) -> None:
+        for module in self.modules[index:]:
             try:
-                if module.process_key(self, self.current_key, is_pressed) is None:
+                key = module.process_key(self, key, is_pressed, int_coord)
+                if key is None:
                     break
             except Exception as err:
-                if self.debug_enabled:
-                    print('Failed to run process_key function in module: ', err, module)
-        else:
-            self.process_key(self.current_key, is_pressed, int_coord, (row, col))
-        return self
+                debug_error(module, 'process_key', err)
 
-    def process_key(self, key, is_pressed, coord_int=None, coord_raw=None):
+        if int_coord is not None:
+            if is_pressed:
+                self._coordkeys_pressed[int_coord] = key
+
+            if debug.enabled:
+                debug('coordkeys_pressed=', self._coordkeys_pressed)
+
+        if key:
+            self.process_key(key, is_pressed, int_coord)
+
+    def process_key(
+        self, key: Key, is_pressed: bool, int_coord: Optional[int] = None
+    ) -> None:
         if is_pressed:
-            key.on_press(self, coord_int, coord_raw)
+            key.on_press(self, int_coord)
         else:
-            key.on_release(self, coord_int, coord_raw)
+            key.on_release(self, int_coord)
 
-        return self
+    def resume_process_key(
+        self,
+        module: Module,
+        key: Key,
+        is_pressed: bool,
+        int_coord: Optional[int] = None,
+        reprocess: Optional[bool] = False,
+    ) -> None:
+        index = self.modules.index(module) + (0 if reprocess else 1)
+        ksf = KeyBufferFrame(
+            key=key, is_pressed=is_pressed, int_coord=int_coord, index=index
+        )
+        self._resume_buffer.append(ksf)
 
-    def remove_key(self, keycode):
-        self.keys_pressed.discard(keycode)
-        return self.process_key(keycode, False)
+    def remove_key(self, keycode: Key) -> None:
+        self.process_key(keycode, False)
 
-    def add_key(self, keycode):
-        self.keys_pressed.add(keycode)
-        return self.process_key(keycode, True)
+    def add_key(self, keycode: Key) -> None:
+        self.process_key(keycode, True)
 
-    def tap_key(self, keycode):
+    def tap_key(self, keycode: Key) -> None:
         self.add_key(keycode)
         # On the next cycle, we'll remove the key.
-        self.set_timeout(False, lambda: self.remove_key(keycode))
+        self.set_timeout(0, lambda: self.remove_key(keycode))
 
-        return self
+    def set_timeout(self, after_ticks: int, callback: Callable[[None], None]) -> [Task]:
+        return create_task(callback, after_ms=after_ticks)
 
-    def set_timeout(self, after_ticks, callback):
-        if after_ticks is False:
-            # We allow passing False as an implicit "run this on the next process timeouts cycle"
-            timeout_key = ticks_ms()
-        else:
-            timeout_key = ticks_ms() + after_ticks
+    def cancel_timeout(self, timeout_key: int) -> None:
+        cancel_task(timeout_key)
 
-        while timeout_key in self._timeouts:
-            timeout_key += 1
+    def _process_timeouts(self) -> None:
+        for task in get_due_task():
+            task()
 
-        self._timeouts[timeout_key] = callback
-        return timeout_key
-
-    def cancel_timeout(self, timeout_key):
-        if timeout_key in self._timeouts:
-            del self._timeouts[timeout_key]
-
-    def _process_timeouts(self):
-        if not self._timeouts:
-            return self
-
-        current_time = ticks_ms()
-
-        # cast this to a tuple to ensure that if a callback itself sets
-        # timeouts, we do not handle them on the current cycle
-        timeouts = tuple(self._timeouts.items())
-
-        for k, v in timeouts:
-            if k <= current_time:
-                v()
-                del self._timeouts[k]
-
-        return self
-
-    def _init_sanity_check(self):
-        '''
-        Ensure the provided configuration is *probably* bootable
-        '''
-        assert self.keymap, 'must define a keymap with at least one row'
-        assert self.row_pins, 'no GPIO pins defined for matrix rows'
-        assert self.col_pins, 'no GPIO pins defined for matrix columns'
-        assert self.diode_orientation is not None, 'diode orientation must be defined'
-        assert (
-            self.hid_type in HIDModes.ALL_MODES
-        ), 'hid_type must be a value from kmk.consts.HIDModes'
-
-        return self
-
-    def _init_coord_mapping(self):
+    def _init_coord_mapping(self) -> None:
         '''
         Attempt to sanely guess a coord_mapping if one is not provided. No-op
         if `kmk.extensions.split.Split` is used, it provides equivalent
@@ -253,16 +265,12 @@ class KMKKeyboard:
             return
 
         if not self.coord_mapping:
-            self.coord_mapping = []
+            cm = []
+            for m in self.matrix:
+                cm.extend(m.coord_mapping)
+            self.coord_mapping = tuple(cm)
 
-            rows_to_calc = len(self.row_pins)
-            cols_to_calc = len(self.col_pins)
-
-            for ridx in range(rows_to_calc):
-                for cidx in range(cols_to_calc):
-                    self.coord_mapping.append(intify_coordinate(ridx, cidx))
-
-    def _init_hid(self):
+    def _init_hid(self) -> None:
         if self.hid_type == HIDModes.NOOP:
             self._hid_helper = AbstractHID
         elif self.hid_type == HIDModes.USB:
@@ -272,172 +280,249 @@ class KMKKeyboard:
         else:
             self._hid_helper = AbstractHID
         self._hid_helper = self._hid_helper(**self._go_args)
+        self._hid_send_enabled = True
 
-    def _init_matrix(self):
-        self.matrix = self.matrix_scanner(
-            cols=self.col_pins,
-            rows=self.row_pins,
-            diode_orientation=self.diode_orientation,
-            rollover_cols_every_rows=getattr(self, 'rollover_cols_every_rows', None),
-        )
+        if debug.enabled:
+            debug('hid=', self._hid_helper)
 
-        return self
+    def _deinit_hid(self) -> None:
+        try:
+            self._hid_helper.create_report({})
+            self._hid_helper.send()
+        except Exception as e:
+            debug_error(self, '_deinit_hid', e)
 
-    def before_matrix_scan(self):
+    def _init_matrix(self) -> None:
+        if self.matrix is None:
+            self.matrix = MatrixScanner(
+                column_pins=self.col_pins,
+                row_pins=self.row_pins,
+                columns_to_anodes=self.diode_orientation,
+            )
+
+        try:
+            self.matrix = tuple(iter(self.matrix))
+            offset = 0
+            for matrix in self.matrix:
+                matrix.offset = offset
+                offset += matrix.key_count
+        except TypeError:
+            self.matrix = (self.matrix,)
+
+        if debug.enabled:
+            debug('matrix=', [_.__class__.__name__ for _ in self.matrix])
+
+    def during_bootup(self) -> None:
+        # Modules and extensions that fail `during_bootup` get removed from
+        # their respective lists. This serves as a self-check mechanism; any
+        # modules or extensions that initialize peripherals or data structures
+        # should do that in `during_bootup`.
+        for idx, module in enumerate(self.modules):
+            try:
+                module.during_bootup(self)
+            except Exception as err:
+                debug_error(module, 'during_bootup', err)
+                self.modules[idx] = None
+
+        self.modules[:] = [_ for _ in self.modules if _]
+
+        if debug.enabled:
+            debug('modules=', [_.__class__.__name__ for _ in self.modules])
+
+        for idx, ext in enumerate(self.extensions):
+            try:
+                ext.during_bootup(self)
+            except Exception as err:
+                debug_error(ext, 'during_bootup', err)
+                self.extensions[idx] = None
+
+        self.extensions[:] = [_ for _ in self.extensions if _]
+
+        if debug.enabled:
+            debug('extensions=', [_.__class__.__name__ for _ in self.extensions])
+
+    def before_matrix_scan(self) -> None:
         for module in self.modules:
             try:
                 module.before_matrix_scan(self)
             except Exception as err:
-                if self.debug_enabled:
-                    print('Failed to run pre matrix function in module: ', err, module)
+                debug_error(module, 'before_matrix_scan', err)
 
         for ext in self.extensions:
             try:
                 ext.before_matrix_scan(self.sandbox)
             except Exception as err:
-                if self.debug_enabled:
-                    print('Failed to run pre matrix function in extension: ', err, ext)
+                debug_error(ext, 'before_matrix_scan', err)
 
-    def after_matrix_scan(self):
+    def after_matrix_scan(self) -> None:
         for module in self.modules:
             try:
                 module.after_matrix_scan(self)
             except Exception as err:
-                if self.debug_enabled:
-                    print('Failed to run post matrix function in module: ', err, module)
+                debug_error(module, 'after_matrix_scan', err)
 
         for ext in self.extensions:
             try:
                 ext.after_matrix_scan(self.sandbox)
             except Exception as err:
-                if self.debug_enabled:
-                    print('Failed to run post matrix function in extension: ', err, ext)
+                debug_error(ext, 'after_matrix_scan', err)
 
-    def before_hid_send(self):
+    def before_hid_send(self) -> None:
         for module in self.modules:
             try:
                 module.before_hid_send(self)
             except Exception as err:
-                if self.debug_enabled:
-                    print('Failed to run pre hid function in module: ', err, module)
+                debug_error(module, 'before_hid_send', err)
 
         for ext in self.extensions:
             try:
                 ext.before_hid_send(self.sandbox)
             except Exception as err:
-                if self.debug_enabled:
-                    print('Failed to run pre hid function in extension: ', err, ext)
+                debug_error(ext, 'before_hid_send', err)
 
-    def after_hid_send(self):
+    def after_hid_send(self) -> None:
         for module in self.modules:
             try:
                 module.after_hid_send(self)
             except Exception as err:
-                if self.debug_enabled:
-                    print('Failed to run post hid function in module: ', err, module)
+                debug_error(module, 'after_hid_send', err)
 
         for ext in self.extensions:
             try:
                 ext.after_hid_send(self.sandbox)
             except Exception as err:
-                if self.debug_enabled:
-                    print('Failed to run post hid function in extension: ', err, ext)
+                debug_error(ext, 'after_hid_send', err)
 
-    def powersave_enable(self):
+    def powersave_enable(self) -> None:
         for module in self.modules:
             try:
                 module.on_powersave_enable(self)
             except Exception as err:
-                if self.debug_enabled:
-                    print('Failed to run post hid function in module: ', err, module)
+                debug_error(module, 'powersave_enable', err)
 
         for ext in self.extensions:
             try:
                 ext.on_powersave_enable(self.sandbox)
             except Exception as err:
-                if self.debug_enabled:
-                    print('Failed to run post hid function in extension: ', err, ext)
+                debug_error(ext, 'powersave_enable', err)
 
-    def powersave_disable(self):
+    def powersave_disable(self) -> None:
         for module in self.modules:
             try:
                 module.on_powersave_disable(self)
             except Exception as err:
-                if self.debug_enabled:
-                    print('Failed to run post hid function in module: ', err, module)
+                debug_error(module, 'powersave_disable', err)
+
         for ext in self.extensions:
             try:
                 ext.on_powersave_disable(self.sandbox)
             except Exception as err:
-                if self.debug_enabled:
-                    print('Failed to run post hid function in extension: ', err, ext)
+                debug_error(ext, 'powersave_disable', err)
 
-    def go(self, hid_type=HIDModes.USB, secondary_hid_type=None, **kwargs):
+    def deinit(self) -> None:
+        for module in self.modules:
+            try:
+                module.deinit(self)
+            except Exception as err:
+                debug_error(module, 'deinit', err)
+
+        for ext in self.extensions:
+            try:
+                ext.deinit(self.sandbox)
+            except Exception as err:
+                debug_error(ext, 'deinit', err)
+
+    def go(self, hid_type=HIDModes.USB, secondary_hid_type=None, **kwargs) -> None:
+        try:
+            self._init(
+                hid_type=hid_type,
+                secondary_hid_type=secondary_hid_type,
+                **kwargs,
+            )
+            while True:
+                self._main_loop()
+        except Exception as err:
+            import traceback
+
+            traceback.print_exception(err)
+        finally:
+            debug('cleaning up...')
+            self._deinit_hid()
+            self.deinit()
+            debug('...done')
+
+            if not debug.enabled:
+                import supervisor
+
+                supervisor.reload()
+
+    def _init(
+        self,
+        hid_type: HIDModes = HIDModes.USB,
+        secondary_hid_type: Optional[HIDModes] = None,
+        **kwargs,
+    ) -> None:
         self._go_args = kwargs
         self.hid_type = hid_type
         self.secondary_hid_type = secondary_hid_type
 
-        self._init_sanity_check()
-        self._init_coord_mapping()
+        if debug.enabled:
+            debug('Initialising ', self)
+
         self._init_hid()
-
-        for module in self.modules:
-            try:
-                module.during_bootup(self)
-            except Exception:
-                if self.debug_enabled:
-                    print('Failed to load module', module)
-        for ext in self.extensions:
-            try:
-                ext.during_bootup(self)
-            except Exception:
-                if self.debug_enabled:
-                    print('Failed to load extension', ext)
-
         self._init_matrix()
+        self._init_coord_mapping()
+        self.during_bootup()
 
-        self._print_debug_cycle(init=True)
+        if debug.enabled:
+            import gc
 
-        while True:
-            self.current_key = None
-            self.state_changed = False
-            self.sandbox.active_layers = self.active_layers.copy()
+            gc.collect()
+            debug('mem_info used:', gc.mem_alloc(), ' free:', gc.mem_free())
 
-            self.before_matrix_scan()
+    def _main_loop(self) -> None:
+        self.sandbox.active_layers = self.active_layers.copy()
 
-            self.matrix_update = (
-                self.sandbox.matrix_update
-            ) = self.matrix.scan_for_changes()
-            self.sandbox.secondary_matrix_update = self.secondary_matrix_update
+        self.before_matrix_scan()
 
-            self.after_matrix_scan()
+        self._process_resume_buffer()
 
-            self._handle_matrix_report(self.secondary_matrix_update)
+        for matrix in self.matrix:
+            update = matrix.scan_for_changes()
+            if update:
+                self.matrix_update = update
+                break
+        self.sandbox.matrix_update = self.matrix_update
+        self.sandbox.secondary_matrix_update = self.secondary_matrix_update
+
+        self.after_matrix_scan()
+
+        if self.secondary_matrix_update:
+            self.matrix_update_queue.append(self.secondary_matrix_update)
             self.secondary_matrix_update = None
-            self._handle_matrix_report(self.matrix_update)
+
+        if self.matrix_update:
+            self.matrix_update_queue.append(self.matrix_update)
             self.matrix_update = None
 
-            self.before_hid_send()
+        # only handle one key per cycle.
+        if self.matrix_update_queue:
+            self._handle_matrix_report(self.matrix_update_queue.pop(0))
 
-            if self.hid_pending:
-                self._send_hid()
+        self.before_hid_send()
 
-            self._old_timeouts_len = len(self._timeouts)
-            self._process_timeouts()
-            self._new_timeouts_len = len(self._timeouts)
+        if self.hid_pending:
+            self._send_hid()
 
-            if self._old_timeouts_len != self._new_timeouts_len:
-                self.state_changed = True
-                if self.hid_pending:
-                    self._send_hid()
+        self._process_timeouts()
 
-            self.after_hid_send()
+        if self.hid_pending:
+            self._send_hid()
 
-            if self._trigger_powersave_enable:
-                self.powersave_enable()
+        self.after_hid_send()
 
-            if self._trigger_powersave_disable:
-                self.powersave_disable()
+        if self._trigger_powersave_enable:
+            self.powersave_enable()
 
-            if self.state_changed:
-                self._print_debug_cycle()
+        if self._trigger_powersave_disable:
+            self.powersave_disable()

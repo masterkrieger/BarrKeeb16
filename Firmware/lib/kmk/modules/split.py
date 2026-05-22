@@ -1,13 +1,18 @@
 '''Enables splitting keyboards wirelessly or wired'''
+
 import busio
 from micropython import const
-from supervisor import ticks_ms
+from supervisor import runtime, ticks_ms
 
+from keypad import Event as KeyEvent
 from storage import getmount
 
+from kmk.hid import HIDModes
 from kmk.kmktime import check_deadline
-from kmk.matrix import intify_coordinate
 from kmk.modules import Module
+from kmk.utils import Debug
+
+debug = Debug(__name__)
 
 
 class SplitSide:
@@ -34,9 +39,9 @@ class Split(Module):
         uart_interval=20,
         data_pin=None,
         data_pin2=None,
-        target_left=True,
         uart_flip=True,
-        debug_enabled=False,
+        use_pio=False,
+        add_buttons=0,  # add single-pin buttons, rotary encoder actions, etc. per-side.
     ):
         self._is_target = True
         self._uart_buffer = []
@@ -47,12 +52,13 @@ class Split(Module):
         self.split_offset = None
         self.data_pin = data_pin
         self.data_pin2 = data_pin2
-        self.target_left = target_left
         self.uart_flip = uart_flip
-        self._is_target = True
+        self._use_pio = use_pio
         self._uart = None
+        self.add_buttons = add_buttons
         self._uart_interval = uart_interval
-        self._debug_enabled = debug_enabled
+        self.uart_header = bytearray([0xB2])  # Any non-zero byte should work
+        debug('Split module initializing...')
         if self.split_type == SplitType.BLE:
             try:
                 from adafruit_ble import BLERadio
@@ -61,76 +67,137 @@ class Split(Module):
                 )
                 from adafruit_ble.services.nordic import UARTService
 
+                self.BLERadio = BLERadio
                 self.ProvideServicesAdvertisement = ProvideServicesAdvertisement
                 self.UARTService = UARTService
             except ImportError:
-                print('BLE Import error')
+                if debug.enabled:
+                    debug('BLE Import error')
                 return  # BLE isn't supported on this platform
-            self._ble = BLERadio()
             self._ble_last_scan = ticks_ms() - 5000
             self._connection_count = 0
+            self._split_connected = False
             self._uart_connection = None
-            self._advertisment = None
+            self._advertisment = None  # Seems to not be used anywhere
             self._advertising = False
             self._psave_enable = False
+
+        if self._use_pio:
+            from kmk.transports.pio_uart import PIO_UART
+
+            self.PIO_UART = PIO_UART
 
     def during_bootup(self, keyboard):
         # Set up name for target side detection and BLE advertisment
         name = str(getmount('/').label)
         if self.split_type == SplitType.BLE:
-            self._ble.name = name
+            if keyboard.hid_type == HIDModes.BLE:
+                self._ble = keyboard._hid_helper.ble
+            else:
+                self._ble = self.BLERadio()
+                self._ble.name = name
         else:
             # Try to guess data pins if not supplied
             if not self.data_pin:
                 self.data_pin = keyboard.data_pin
 
-        # Detect split side from name
-        if self.split_side is None:
-            if name.endswith('L'):
-                # If name ends in 'L' assume left and strip from name
-                self._is_target = bool(self.split_target_left)
-                self.split_side = SplitSide.LEFT
-            elif name.endswith('R'):
-                # If name ends in 'R' assume right and strip from name
-                self._is_target = not bool(self.split_target_left)
-                self.split_side = SplitSide.RIGHT
-
-        # if split side was given, find master from split_side.
-        elif self.split_side == SplitSide.LEFT:
+        debug('Checking split side...')
+        # if split side was given, find target from split_side.
+        if self.split_side == SplitSide.LEFT:
             self._is_target = bool(self.split_target_left)
         elif self.split_side == SplitSide.RIGHT:
             self._is_target = not bool(self.split_target_left)
+        else:
+            # Detect split side from name
+            if (
+                self.split_type == SplitType.UART
+                or self.split_type == SplitType.ONEWIRE
+            ):
+                self._is_target = runtime.usb_connected
+            elif self.split_type == SplitType.BLE:
+                self._is_target = name.endswith('L') == self.split_target_left
 
-        # Flips the col pins if PCB is the same but flipped on right
-        if self.split_flip and self.split_side == SplitSide.RIGHT:
-            keyboard.col_pins = list(reversed(keyboard.col_pins))
+            if name.endswith('L'):
+                self.split_side = SplitSide.LEFT
+            elif name.endswith('R'):
+                self.split_side = SplitSide.RIGHT
 
-        self.split_offset = len(keyboard.col_pins)
+        debug(f'Split side assigned to as: {self.split_side}')
 
-        if self.split_type == SplitType.UART and self.data_pin is not None:
-            if self._is_target:
-                self._uart = busio.UART(
-                    tx=self.data_pin2, rx=self.data_pin, timeout=self._uart_interval
+        if not self._is_target:
+            keyboard._hid_send_enabled = False
+
+        if self.split_offset is None:
+            if self.add_buttons > 0:
+                self.split_offset = (
+                    keyboard.matrix[-1].coord_mapping[-1] + 1 + self.add_buttons
                 )
             else:
-                self._uart = busio.UART(
-                    tx=self.data_pin, rx=self.data_pin2, timeout=self._uart_interval
-                )
+                self.split_offset = keyboard.matrix[-1].coord_mapping[-1] + 1
 
+        if self.split_type == SplitType.UART and self.data_pin is not None:
+            if self._is_target or not self.uart_flip:
+                if self._use_pio:
+                    self._uart = self.PIO_UART(tx=self.data_pin2, rx=self.data_pin)
+                else:
+                    self._uart = busio.UART(
+                        tx=self.data_pin2, rx=self.data_pin, timeout=self._uart_interval
+                    )
+            else:
+                if self._use_pio:
+                    self._uart = self.PIO_UART(tx=self.data_pin, rx=self.data_pin2)
+                else:
+                    self._uart = busio.UART(
+                        tx=self.data_pin, rx=self.data_pin2, timeout=self._uart_interval
+                    )
+        debug(f'Split type assigned as: {self.split_type}')
         # Attempt to sanely guess a coord_mapping if one is not provided.
-        if not keyboard.coord_mapping:
-            keyboard.coord_mapping = []
+        if not keyboard.coord_mapping and keyboard.row_pins and keyboard.col_pins:
+            cm = []
+            debug('Calculating coord_mapping...')
+            rows_to_calc = len(keyboard.row_pins)
+            cols_to_calc = len(keyboard.col_pins)
 
-            rows_to_calc = len(keyboard.row_pins) * 2
-            cols_to_calc = len(keyboard.col_pins) * 2
+            # Flips the col order if PCB is the same but flipped on right
+            cols_rhs = list(range(cols_to_calc))
+            if self.split_flip:
+                cols_rhs = list(reversed(cols_rhs))
 
             for ridx in range(rows_to_calc):
                 for cidx in range(cols_to_calc):
-                    keyboard.coord_mapping.append(intify_coordinate(ridx, cidx))
+                    cm.append(cols_to_calc * ridx + cidx)
+                for cidx in cols_rhs:
+                    # add indexes accounting for any added buttons
+                    if self.add_buttons != 0:
+                        cm.append(
+                            cols_to_calc * (rows_to_calc + ridx)
+                            + cidx
+                            + (self.add_buttons),
+                        )
+                    else:
+                        cm.append(cols_to_calc * (rows_to_calc + ridx) + cidx)
+            # append addded buttons to the final list
+            for a in range(self.add_buttons):
+                cm.append(cols_to_calc * rows_to_calc + cols_rhs[-1] + (a))
+            for a in range(self.add_buttons, self.add_buttons * 2):
+                cm.append(cols_to_calc * (rows_to_calc + cols_rhs[0]) + (a))
+
+            debug('Done calculating coord_mapping:')
+            debug(f'{cm}')
+            keyboard.coord_mapping = tuple(cm)
+
+        if not keyboard.coord_mapping and debug.enabled:
+            debug('Error: please provide coord_mapping for custom scanner')
+
+        if self.split_side == SplitSide.RIGHT:
+            offset = self.split_offset
+            for matrix in keyboard.matrix:
+                matrix.offset = offset
+                offset += matrix.key_count
 
     def before_matrix_scan(self, keyboard):
         if self.split_type == SplitType.BLE:
-            self._check_all_connections()
+            self._check_all_connections(keyboard)
             self._receive_ble(keyboard)
         elif self.split_type == SplitType.UART:
             if self._is_target or self.data_pin2:
@@ -141,18 +208,18 @@ class Split(Module):
 
     def after_matrix_scan(self, keyboard):
         if keyboard.matrix_update:
-            if self.split_type == SplitType.UART and self._is_target:
-                pass  # explicit pass just for dev sanity...
-            elif self.split_type == SplitType.UART and (
-                self.data_pin2 or not self._is_target
-            ):
-                self._send_uart(keyboard.matrix_update)
+            if self.split_type == SplitType.UART:
+                if not self._is_target or self.data_pin2:
+                    self._send_uart(keyboard.matrix_update)
+                else:
+                    pass  # explicit pass just for dev sanity...
             elif self.split_type == SplitType.BLE:
                 self._send_ble(keyboard.matrix_update)
             elif self.split_type == SplitType.ONEWIRE:
                 pass  # Protocol needs written
             else:
-                print('Unexpected case in after_matrix_scan')
+                if debug.enabled:
+                    debug('Unexpected case in after_matrix_scan')
 
         return
 
@@ -177,13 +244,39 @@ class Split(Module):
                 self._uart_connection.connection_interval = 11.25
                 self._psave_enable = False
 
-    def _check_all_connections(self):
+    def _check_all_connections(self, keyboard):
         '''Validates the correct number of BLE connections'''
+        self._previous_connection_count = self._connection_count
         self._connection_count = len(self._ble.connections)
-        if self._is_target and self._connection_count < 2:
-            self._target_advertise()
+        if self._is_target:
+            if self._advertising or not self._check_if_split_connected():
+                self._target_advertise()
+            elif self._connection_count < 2 and keyboard.hid_type == HIDModes.BLE:
+                keyboard._hid_helper.start_advertising()
+
         elif not self._is_target and self._connection_count < 1:
             self._initiator_scan()
+
+    def _check_if_split_connected(self):
+        # I'm looking for a way how to recognize which connection is on and which one off
+        # For now, I found that service name relation to having other CP device
+        if self._connection_count == 0:
+            return False
+        if self._connection_count == 2:
+            self._split_connected = True
+            return True
+
+        # Polling this takes some time so I check only if connection_count changed
+        if self._previous_connection_count == self._connection_count:
+            return self._split_connected
+
+        bleio_connection = self._ble.connections[0]._bleio_connection
+        connection_services = bleio_connection.discover_remote_services()
+        for service in connection_services:
+            if str(service.uuid).startswith("UUID('adaf0001"):
+                self._split_connected = True
+                return True
+        return False
 
     def _initiator_scan(self):
         '''Scans for target device'''
@@ -200,96 +293,108 @@ class Split(Module):
                     break
 
         if not self._uart:
-            if self._debug_enabled:
-                print('Scanning')
+            if debug.enabled:
+                debug('Scanning')
             self._ble.stop_scan()
             for adv in self._ble.start_scan(
                 self.ProvideServicesAdvertisement, timeout=20
             ):
-                if self._debug_enabled:
-                    print('Scanning')
+                if debug.enabled:
+                    debug('Scanning')
                 if self.UARTService in adv.services and adv.rssi > -70:
                     self._uart_connection = self._ble.connect(adv)
                     self._uart_connection.connection_interval = 11.25
                     self._uart = self._uart_connection[self.UARTService]
                     self._ble.stop_scan()
-                    if self._debug_enabled:
-                        print('Scan complete')
+                    if debug.enabled:
+                        debug('Scan complete')
                     break
         self._ble.stop_scan()
 
     def _target_advertise(self):
         '''Advertises the target for the initiator to find'''
+        # Give previous advertising some time to complete
+        if self._advertising:
+            if self._check_if_split_connected():
+                if debug.enabled:
+                    debug('Advertising complete')
+                self._ble.stop_advertising()
+                self._advertising = False
+                return
+
+            if not self.ble_rescan_timer():
+                return
+
+            if debug.enabled:
+                debug('Advertising not answered')
+
         self._ble.stop_advertising()
-        if self._debug_enabled:
-            print('Advertising')
+        if debug.enabled:
+            debug('Advertising')
         # Uart must not change on this connection if reconnecting
         if not self._uart:
             self._uart = self.UARTService()
         advertisement = self.ProvideServicesAdvertisement(self._uart)
 
         self._ble.start_advertising(advertisement)
-
+        self._advertising = True
         self.ble_time_reset()
-        while not self.ble_rescan_timer():
-            self._connection_count = len(self._ble.connections)
-            if self._connection_count > 1:
-                self.ble_time_reset()
-                if self._debug_enabled:
-                    print('Advertising complete')
-                break
-        self._ble.stop_advertising()
 
     def ble_rescan_timer(self):
         '''If true, the rescan timer is up'''
-        return bool(check_deadline(ticks_ms(), self._ble_last_scan) > 5000)
+        return not bool(check_deadline(ticks_ms(), self._ble_last_scan, 5000))
 
     def ble_time_reset(self):
         '''Resets the rescan timer'''
         self._ble_last_scan = ticks_ms()
 
+    def _serialize_update(self, update):
+        buffer = bytearray(2)
+        buffer[0] = update.key_number
+        buffer[1] = update.pressed
+        return buffer
+
+    def _deserialize_update(self, update):
+        kevent = KeyEvent(key_number=update[0], pressed=update[1])
+        return kevent
+
     def _send_ble(self, update):
         if self._uart:
             try:
-                if not self._is_target:
-                    update[1] += self.split_offset
-                self._uart.write(update)
+                self._uart.write(self._serialize_update(update))
             except OSError:
                 try:
                     self._uart.disconnect()
                 except:  # noqa: E722
-                    if self._debug_enabled:
-                        print('UART disconnect failed')
+                    if debug.enabled:
+                        debug('UART disconnect failed')
 
-                if self._debug_enabled:
-                    print('Connection error')
+                if debug.enabled:
+                    debug('Connection error')
                 self._uart_connection = None
                 self._uart = None
 
     def _receive_ble(self, keyboard):
         if self._uart is not None and self._uart.in_waiting > 0 or self._uart_buffer:
-            while self._uart.in_waiting >= 3:
-                self._uart_buffer.append(self._uart.read(3))
+            while self._uart.in_waiting >= 2:
+                update = self._deserialize_update(self._uart.read(2))
+                self._uart_buffer.append(update)
             if self._uart_buffer:
-                keyboard.secondary_matrix_update = bytearray(self._uart_buffer.pop(0))
-                return
+                keyboard.secondary_matrix_update = self._uart_buffer.pop(0)
+
+    def _checksum(self, update):
+        checksum = bytes([sum(update) & 0xFF])
+
+        return checksum
 
     def _send_uart(self, update):
         # Change offsets depending on where the data is going to match the correct
         # matrix location of the receiever
-        if self._is_target:
-            if self.split_target_left:
-                update[1] += self.split_offset
-            else:
-                update[1] -= self.split_offset
-        else:
-            if self.split_target_left:
-                update[1] += self.split_offset
-            else:
-                update[1] -= self.split_offset
-
         if self._uart is not None:
+            update = self._serialize_update(update)
+            self._uart.write(self.uart_header)
             self._uart.write(update)
+            self._uart.write(self._checksum(update))
 
     def _receive_uart(self, keyboard):
         if self._uart is not None and self._uart.in_waiting > 0 or self._uart_buffer:
@@ -299,9 +404,13 @@ class Split(Module):
 
                 microcontroller.reset()
 
-            while self._uart.in_waiting >= 3:
-                self._uart_buffer.append(self._uart.read(3))
-            if self._uart_buffer:
-                keyboard.secondary_matrix_update = bytearray(self._uart_buffer.pop(0))
+            while self._uart.in_waiting >= 4:
+                # Check the header
+                if self._uart.read(1) == self.uart_header:
+                    update = self._uart.read(2)
 
-                return
+                    # check the checksum
+                    if self._checksum(update) == self._uart.read(1):
+                        self._uart_buffer.append(self._deserialize_update(update))
+            if self._uart_buffer:
+                keyboard.secondary_matrix_update = self._uart_buffer.pop(0)

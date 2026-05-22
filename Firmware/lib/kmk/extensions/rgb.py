@@ -1,13 +1,93 @@
-import neopixel
+######################
+#  BarrKeeb16 - kmk/extensions/rgb.py
+#  22-MAY-2026
+#  Modified by: Jeremy Barr
+#
+#  Notes:
+#  CircuitPython compatibility fix:
+#  Some NeoPixel implementations are no longer detected
+#  as PixelBuf subclasses correctly.
+#  in the def during_bootup(self, sandbox) 
+#  FROM:
+#  if issubclass(self.pixels.__class__, PixelBuf):
+#    self.pixels = [self.pixels]
+#
+#  TO:
+#  if not isinstance(self.pixels, list):
+#    self.pixels = [self.pixels]
+######################
 
-import time
+
+from adafruit_pixelbuf import PixelBuf
 from math import e, exp, pi, sin
 
 from kmk.extensions import Extension
-from kmk.handlers.stock import passthrough as handler_passthrough
 from kmk.keys import make_key
+from kmk.scheduler import create_task
+from kmk.utils import Debug, clamp
+
+debug = Debug(__name__)
 
 rgb_config = {}
+
+
+def hsv_to_rgb(hue, sat, val):
+    '''
+    Converts HSV values, and returns a tuple of RGB values
+    :param hue:
+    :param sat:
+    :param val:
+    :return: (r, g, b)
+    '''
+    if sat == 0:
+        return (val, val, val)
+
+    hue = 6 * (hue & 0xFF)
+    frac = hue & 0xFF
+    sxt = hue >> 8
+
+    base = (0xFF - sat) * val
+    color = (val * sat * frac) >> 8
+    val <<= 8
+
+    if sxt == 0:
+        r = val
+        g = base + color
+        b = base
+    elif sxt == 1:
+        r = val - color
+        g = val
+        b = base
+    elif sxt == 2:
+        r = base
+        g = val
+        b = base + color
+    elif sxt == 3:
+        r = base
+        g = val - color
+        b = val
+    elif sxt == 4:
+        r = base + color
+        g = base
+        b = val
+    elif sxt == 5:
+        r = val
+        g = base
+        b = val - color
+
+    return (r >> 8), (g >> 8), (b >> 8)
+
+
+def hsv_to_rgbw(hue, sat, val):
+    '''
+    Converts HSV values, and returns a tuple of RGBW values
+    :param hue:
+    :param sat:
+    :param val:
+    :return: (r, g, b, w)
+    '''
+    rgb = hsv_to_rgb(hue, sat, val)
+    return rgb[0], rgb[1], rgb[2], min(rgb)
 
 
 class AnimationModes:
@@ -24,21 +104,19 @@ class AnimationModes:
 
 class RGB(Extension):
     pos = 0
-    time = int(time.monotonic() * 10)
-    intervals = (30, 20, 10, 5)
 
     def __init__(
         self,
         pixel_pin,
         num_pixels=0,
-        val_limit=100,
-        hue_default=100,
-        sat_default=100,
         rgb_order=(1, 0, 2),  # GRB WS2812
-        val_default=100,
-        hue_step=5,
-        sat_step=5,
-        val_step=5,
+        val_limit=255,
+        hue_default=0,
+        sat_default=255,
+        val_default=255,
+        hue_step=4,
+        sat_step=13,
+        val_step=13,
         animation_speed=1,
         breathe_center=1,  # 1.0-2.7
         knight_effect_length=3,
@@ -46,19 +124,12 @@ class RGB(Extension):
         effect_init=False,
         reverse_animation=False,
         user_animation=None,
-        disable_auto_write=False,
-        loopcounter=0,
+        pixels=None,
+        refresh_rate=60,
     ):
-        self.neopixel = neopixel.NeoPixel(
-            pixel_pin,
-            num_pixels,
-            pixel_order=rgb_order,
-            auto_write=not disable_auto_write,
-        )
-
-        self.rgbw = bool(len(rgb_order) == 4)
-
+        self.pixel_pin = pixel_pin
         self.num_pixels = num_pixels
+        self.rgb_order = rgb_order
         self.hue_step = hue_step
         self.sat_step = sat_step
         self.val_step = val_step
@@ -76,71 +147,32 @@ class RGB(Extension):
         self.effect_init = effect_init
         self.reverse_animation = reverse_animation
         self.user_animation = user_animation
-        self.disable_auto_write = disable_auto_write
-        self.loopcounter = loopcounter
+        self.pixels = pixels
+        self.refresh_rate = refresh_rate
 
-        make_key(
-            names=('RGB_TOG',), on_press=self._rgb_tog, on_release=handler_passthrough
-        )
-        make_key(
-            names=('RGB_HUI',), on_press=self._rgb_hui, on_release=handler_passthrough
-        )
-        make_key(
-            names=('RGB_HUD',), on_press=self._rgb_hud, on_release=handler_passthrough
-        )
-        make_key(
-            names=('RGB_SAI',), on_press=self._rgb_sai, on_release=handler_passthrough
-        )
-        make_key(
-            names=('RGB_SAD',), on_press=self._rgb_sad, on_release=handler_passthrough
-        )
-        make_key(
-            names=('RGB_VAI',), on_press=self._rgb_vai, on_release=handler_passthrough
-        )
-        make_key(
-            names=('RGB_VAD',), on_press=self._rgb_vad, on_release=handler_passthrough
-        )
-        make_key(
-            names=('RGB_ANI',), on_press=self._rgb_ani, on_release=handler_passthrough
-        )
-        make_key(
-            names=('RGB_AND',), on_press=self._rgb_and, on_release=handler_passthrough
-        )
-        make_key(
-            names=('RGB_MODE_PLAIN', 'RGB_M_P'),
-            on_press=self._rgb_mode_static,
-            on_release=handler_passthrough,
-        )
-        make_key(
-            names=('RGB_MODE_BREATHE', 'RGB_M_B'),
-            on_press=self._rgb_mode_breathe,
-            on_release=handler_passthrough,
-        )
-        make_key(
-            names=('RGB_MODE_RAINBOW', 'RGB_M_R'),
-            on_press=self._rgb_mode_rainbow,
-            on_release=handler_passthrough,
-        )
+        self.rgbw = bool(len(rgb_order) == 4)
+
+        self._substep = 0
+
+        make_key(names=('RGB_TOG',), on_press=self._rgb_tog)
+        make_key(names=('RGB_HUI',), on_press=self._rgb_hui)
+        make_key(names=('RGB_HUD',), on_press=self._rgb_hud)
+        make_key(names=('RGB_SAI',), on_press=self._rgb_sai)
+        make_key(names=('RGB_SAD',), on_press=self._rgb_sad)
+        make_key(names=('RGB_VAI',), on_press=self._rgb_vai)
+        make_key(names=('RGB_VAD',), on_press=self._rgb_vad)
+        make_key(names=('RGB_ANI',), on_press=self._rgb_ani)
+        make_key(names=('RGB_AND',), on_press=self._rgb_and)
+        make_key(names=('RGB_MODE_PLAIN', 'RGB_M_P'), on_press=self._rgb_mode_static)
+        make_key(names=('RGB_MODE_BREATHE', 'RGB_M_B'), on_press=self._rgb_mode_breathe)
+        make_key(names=('RGB_MODE_RAINBOW', 'RGB_M_R'), on_press=self._rgb_mode_rainbow)
         make_key(
             names=('RGB_MODE_BREATHE_RAINBOW', 'RGB_M_BR'),
             on_press=self._rgb_mode_breathe_rainbow,
-            on_release=handler_passthrough,
         )
-        make_key(
-            names=('RGB_MODE_SWIRL', 'RGB_M_S'),
-            on_press=self._rgb_mode_swirl,
-            on_release=handler_passthrough,
-        )
-        make_key(
-            names=('RGB_MODE_KNIGHT', 'RGB_M_K'),
-            on_press=self._rgb_mode_knight,
-            on_release=handler_passthrough,
-        )
-        make_key(
-            names=('RGB_RESET', 'RGB_RST'),
-            on_press=self._rgb_reset,
-            on_release=handler_passthrough,
-        )
+        make_key(names=('RGB_MODE_SWIRL', 'RGB_M_S'), on_press=self._rgb_mode_swirl)
+        make_key(names=('RGB_MODE_KNIGHT', 'RGB_M_K'), on_press=self._rgb_mode_knight)
+        make_key(names=('RGB_RESET', 'RGB_RST'), on_press=self._rgb_reset)
 
     def on_runtime_enable(self, sandbox):
         return
@@ -149,7 +181,35 @@ class RGB(Extension):
         return
 
     def during_bootup(self, sandbox):
-        return
+        if self.pixels is None:
+            import neopixel
+            self.pixels = neopixel.NeoPixel(
+                self.pixel_pin,
+                self.num_pixels,
+                pixel_order=self.rgb_order,
+            )
+
+        # CircuitPython compatibility fix:
+        # Some NeoPixel implementations are no longer detected
+        # as PixelBuf subclasses correctly.
+        if not isinstance(self.pixels, list):
+            self.pixels = [self.pixels]
+
+        for pixel in self.pixels:
+            try:
+                pixel.auto_write = False
+            except AttributeError:
+                pass
+
+        if self.num_pixels == 0:
+            for pixels in self.pixels:
+                self.num_pixels += len(pixels)
+
+        if debug.enabled:
+            for n, pixels in enumerate(self.pixels):
+                debug(f'pixels[{n}] = {pixels.__class__}[{len(pixels)}]')
+
+        self._task = create_task(self.animate, period_ms=(1000 // self.refresh_rate))
 
     def before_matrix_scan(self, sandbox):
         return
@@ -161,7 +221,7 @@ class RGB(Extension):
         return
 
     def after_hid_send(self, sandbox):
-        self.animate()
+        pass
 
     def on_powersave_enable(self, sandbox):
         return
@@ -169,72 +229,9 @@ class RGB(Extension):
     def on_powersave_disable(self, sandbox):
         self._do_update()
 
-    @staticmethod
-    def time_ms():
-        return int(time.monotonic() * 1000)
-
-    def hsv_to_rgb(self, hue, sat, val):
-        '''
-        Converts HSV values, and returns a tuple of RGB values
-        :param hue:
-        :param sat:
-        :param val:
-        :return: (r, g, b)
-        '''
-        r = 0
-        g = 0
-        b = 0
-
-        if val > self.val_limit:
-            val = self.val_limit
-
-        if sat == 0:
-            r = val
-            g = val
-            b = val
-
-        else:
-            base = ((100 - sat) * val) / 100
-            color = (val - base) * ((hue % 60) / 60)
-
-            x = int(hue / 60)
-            if x == 0:
-                r = val
-                g = base + color
-                b = base
-            elif x == 1:
-                r = val - color
-                g = val
-                b = base
-            elif x == 2:
-                r = base
-                g = val
-                b = base + color
-            elif x == 3:
-                r = base
-                g = val - color
-                b = val
-            elif x == 4:
-                r = base + color
-                g = base
-                b = val
-            elif x == 5:
-                r = val
-                g = base
-                b = val - color
-
-        return int(r), int(g), int(b)
-
-    def hsv_to_rgbw(self, hue, sat, val):
-        '''
-        Converts HSV values, and returns a tuple of RGBW values
-        :param hue:
-        :param sat:
-        :param val:
-        :return: (r, g, b, w)
-        '''
-        rgb = self.hsv_to_rgb(hue, sat, val)
-        return rgb[0], rgb[1], rgb[2], min(rgb)
+    def deinit(self, sandbox):
+        for pixel in self.pixels:
+            pixel.deinit()
 
     def set_hsv(self, hue, sat, val, index):
         '''
@@ -244,11 +241,13 @@ class RGB(Extension):
         :param val:
         :param index: Index of LED/Pixel
         '''
-        if self.neopixel:
-            if self.rgbw:
-                self.set_rgb(self.hsv_to_rgbw(hue, sat, val), index)
-            else:
-                self.set_rgb(self.hsv_to_rgb(hue, sat, val), index)
+
+        val = clamp(val, 0, self.val_limit)
+
+        if self.rgbw:
+            self.set_rgb(hsv_to_rgbw(hue, sat, val), index)
+        else:
+            self.set_rgb(hsv_to_rgb(hue, sat, val), index)
 
     def set_hsv_fill(self, hue, sat, val):
         '''
@@ -257,11 +256,13 @@ class RGB(Extension):
         :param sat:
         :param val:
         '''
-        if self.neopixel:
-            if self.rgbw:
-                self.set_rgb_fill(self.hsv_to_rgbw(hue, sat, val))
-            else:
-                self.set_rgb_fill(self.hsv_to_rgb(hue, sat, val))
+
+        val = clamp(val, 0, self.val_limit)
+
+        if self.rgbw:
+            self.set_rgb_fill(hsv_to_rgbw(hue, sat, val))
+        else:
+            self.set_rgb_fill(hsv_to_rgb(hue, sat, val))
 
     def set_rgb(self, rgb, index):
         '''
@@ -269,62 +270,59 @@ class RGB(Extension):
         :param rgb: RGB or RGBW
         :param index: Index of LED/Pixel
         '''
-        if self.neopixel and 0 <= index <= self.num_pixels - 1:
-            self.neopixel[index] = rgb
-            if not self.disable_auto_write:
-                self.neopixel.show()
+        if 0 <= index <= self.num_pixels - 1:
+            for pixels in self.pixels:
+                if index <= (len(pixels) - 1):
+                    pixels[index] = rgb
+                    break
+                index -= len(pixels)
 
     def set_rgb_fill(self, rgb):
         '''
         Takes an RGB or RGBW and displays it on all LEDs/Neopixels
         :param rgb: RGB or RGBW
         '''
-        if self.neopixel:
-            self.neopixel.fill(rgb)
-            if not self.disable_auto_write:
-                self.neopixel.show()
+        for pixels in self.pixels:
+            pixels.fill(rgb)
 
     def increase_hue(self, step=None):
         '''
-        Increases hue by step amount rolling at 360 and returning to 0
+        Increases hue by step amount rolling at 256 and returning to 0
         :param step:
         '''
-        if not step:
+        if step is None:
             step = self.hue_step
 
-        self.hue = (self.hue + step) % 360
+        self.hue = (self.hue + step) % 256
 
         if self._check_update():
             self._do_update()
 
     def decrease_hue(self, step=None):
         '''
-        Decreases hue by step amount rolling at 0 and returning to 360
+        Decreases hue by step amount rolling at 0 and returning to 256
         :param step:
         '''
-        if not step:
+        if step is None:
             step = self.hue_step
 
         if (self.hue - step) <= 0:
-            self.hue = (self.hue + 360 - step) % 360
+            self.hue = (self.hue + 256 - step) % 256
         else:
-            self.hue = (self.hue - step) % 360
+            self.hue = (self.hue - step) % 256
 
         if self._check_update():
             self._do_update()
 
     def increase_sat(self, step=None):
         '''
-        Increases saturation by step amount stopping at 100
+        Increases saturation by step amount stopping at 255
         :param step:
         '''
-        if not step:
+        if step is None:
             step = self.sat_step
 
-        if self.sat + step >= 100:
-            self.sat = 100
-        else:
-            self.sat += step
+        self.sat = clamp(self.sat + step, 0, 255)
 
         if self._check_update():
             self._do_update()
@@ -334,13 +332,10 @@ class RGB(Extension):
         Decreases saturation by step amount stopping at 0
         :param step:
         '''
-        if not step:
+        if step is None:
             step = self.sat_step
 
-        if (self.sat - step) <= 0:
-            self.sat = 0
-        else:
-            self.sat -= step
+        self.sat = clamp(self.sat - step, 0, 255)
 
         if self._check_update():
             self._do_update()
@@ -350,12 +345,10 @@ class RGB(Extension):
         Increases value by step amount stopping at 100
         :param step:
         '''
-        if not step:
+        if step is None:
             step = self.val_step
-        if (self.val + step) >= 100:
-            self.val = 100
-        else:
-            self.val += step
+
+        self.val = clamp(self.val + step, 0, 255)
 
         if self._check_update():
             self._do_update()
@@ -365,12 +358,10 @@ class RGB(Extension):
         Decreases value by step amount stopping at 0
         :param step:
         '''
-        if not step:
+        if step is None:
             step = self.val_step
-        if (self.val - step) <= 0:
-            self.val = 0
-        else:
-            self.val -= step
+
+        self.val = clamp(self.val - step, 0, 255)
 
         if self._check_update():
             self._do_update()
@@ -380,10 +371,8 @@ class RGB(Extension):
         Increases animation speed by 1 amount stopping at 10
         :param step:
         '''
-        if (self.animation_speed + 1) > 10:
-            self.animation_speed = 10
-        else:
-            self.animation_speed += 1
+        self.animation_speed = clamp(self.animation_speed + 1, 0, 10)
+
         if self._check_update():
             self._do_update()
 
@@ -392,10 +381,8 @@ class RGB(Extension):
         Decreases animation speed by 1 amount stopping at 0
         :param step:
         '''
-        if (self.animation_speed - 1) <= 0:
-            self.animation_speed = 0
-        else:
-            self.animation_speed -= 1
+        self.animation_speed = clamp(self.animation_speed - 1, 0, 10)
+
         if self._check_update():
             self._do_update()
 
@@ -403,15 +390,16 @@ class RGB(Extension):
         '''
         Turns off all LEDs/Neopixels without changing stored values
         '''
-        if self.neopixel:
-            self.set_hsv_fill(0, 0, 0)
+        self.set_hsv_fill(0, 0, 0)
+
+        self.show()
 
     def show(self):
         '''
         Turns on all LEDs/Neopixels without changing stored values
         '''
-        if self.neopixel:
-            self.neopixel.show()
+        for pixels in self.pixels:
+            pixels.show()
 
     def animate(self):
         '''
@@ -421,49 +409,41 @@ class RGB(Extension):
         if self.effect_init:
             self._init_effect()
 
-        if self.animation_mode is not AnimationModes.STATIC_STANDBY:
-            self.loopcounter += 1
-            if self.loopcounter >= 7 and self.enable:
-                self.loopcounter = 0
-                if self.animation_mode == AnimationModes.BREATHING:
-                    self.effect_breathing()
-                elif self.animation_mode == AnimationModes.RAINBOW:
-                    self.effect_rainbow()
-                elif self.animation_mode == AnimationModes.BREATHING_RAINBOW:
-                    self.effect_breathing_rainbow()
-                elif self.animation_mode == AnimationModes.STATIC:
-                    self.effect_static()
-                elif self.animation_mode == AnimationModes.KNIGHT:
-                    self.effect_knight()
-                elif self.animation_mode == AnimationModes.SWIRL:
-                    self.effect_swirl()
-                elif self.animation_mode == AnimationModes.USER:
-                    self.user_animation(self)
-                elif self.animation_mode == AnimationModes.STATIC_STANDBY:
-                    pass
-                else:
-                    self.off()
-                if self.loopcounter >= 7:
-                    self.loopcounter = 0
+        if self.animation_mode is AnimationModes.STATIC_STANDBY:
+            return
+
+        if not self.enable:
+            return
+
+        self._animation_step()
+
+        if self.animation_mode == AnimationModes.STATIC_STANDBY:
+            return
+        elif self.animation_mode == AnimationModes.BREATHING:
+            self.effect_breathing()
+        elif self.animation_mode == AnimationModes.BREATHING_RAINBOW:
+            self.effect_breathing_rainbow()
+        elif self.animation_mode == AnimationModes.KNIGHT:
+            self.effect_knight()
+        elif self.animation_mode == AnimationModes.RAINBOW:
+            self.effect_rainbow()
+        elif self.animation_mode == AnimationModes.STATIC:
+            self.effect_static()
+        elif self.animation_mode == AnimationModes.SWIRL:
+            self.effect_swirl()
+        elif self.animation_mode == AnimationModes.USER:
+            self.user_animation(self)
+        else:
+            self.off()
+
+        self.show()
 
     def _animation_step(self):
-        interval = self.time_ms() - self.time
-        if interval >= max(self.intervals):
-            self.time = self.time_ms()
-            return max(self.intervals)
-        if interval in self.intervals:
-            return interval
-        return None
+        self._substep += self.animation_speed / 4
+        self._step = int(self._substep)
+        self._substep -= self._step
 
     def _init_effect(self):
-        if (
-            self.animation_mode == AnimationModes.BREATHING
-            or self.animation_mode == AnimationModes.BREATHING_RAINBOW
-        ):
-            self.intervals = (30, 20, 10, 5)
-        elif self.animation_mode == AnimationModes.SWIRL:
-            self.intervals = (50, 50)
-
         self.pos = 0
         self.reverse_animation = False
         self.effect_init = False
@@ -484,35 +464,29 @@ class RGB(Extension):
         # https://github.com/qmk/qmk_firmware/blob/9f1d781fcb7129a07e671a46461e501e3f1ae59d/quantum/rgblight.c#L806
         sined = sin((self.pos / 255.0) * pi)
         multip_1 = exp(sined) - self.breathe_center / e
-        multip_2 = self.val_limit / (e - 1 / e)
+        multip_2 = clamp(self.val, 0, self.val_limit) / (e - 1 / e)
 
-        self.val = int(multip_1 * multip_2)
-        self.pos = (self.pos + self.animation_speed) % 256
-        self.set_hsv_fill(self.hue, self.sat, self.val)
+        val = int(multip_1 * multip_2)
+        self.pos = (self.pos + self._step) % 256
+        self.set_hsv_fill(self.hue, self.sat, val)
 
     def effect_breathing_rainbow(self):
-        self.increase_hue(self.animation_speed)
+        self.increase_hue(self._step)
         self.effect_breathing()
 
     def effect_rainbow(self):
-        self.increase_hue(self.animation_speed)
+        self.increase_hue(self._step)
         self.set_hsv_fill(self.hue, self.sat, self.val)
 
     def effect_swirl(self):
-        self.increase_hue(self.animation_speed)
-        self.disable_auto_write = True  # Turn off instantly showing
+        self.increase_hue(self._step)
         for i in range(0, self.num_pixels):
             self.set_hsv(
-                (self.hue - (i * self.num_pixels)) % 360, self.sat, self.val, i
+                (self.hue - (i * self.num_pixels)) % 256, self.sat, self.val, i
             )
-
-        # Show final results
-        self.disable_auto_write = False  # Resume showing changes
-        self.show()
 
     def effect_knight(self):
         # Determine which LEDs should be lit up
-        self.disable_auto_write = True  # Turn off instantly showing
         self.off()  # Fill all off
         pos = int(self.pos)
 
@@ -521,17 +495,15 @@ class RGB(Extension):
             self.set_hsv(self.hue, self.sat, self.val, i)
 
         # Reverse animation when a boundary is hit
-        if pos >= self.num_pixels or pos - 1 < (self.knight_effect_length * -1):
-            self.reverse_animation = not self.reverse_animation
+        if pos >= self.num_pixels:
+            self.reverse_animation = True
+        elif 1 - pos > self.knight_effect_length:
+            self.reverse_animation = False
 
         if self.reverse_animation:
-            self.pos -= self.animation_speed / 2
+            self.pos -= self._step / 2
         else:
-            self.pos += self.animation_speed / 2
-
-        # Show final results
-        self.disable_auto_write = False  # Resume showing changes
-        self.show()
+            self.pos += self._step / 2
 
     def _rgb_tog(self, *args, **kwargs):
         if self.animation_mode == AnimationModes.STATIC:
@@ -599,3 +571,4 @@ class RGB(Extension):
         if self.animation_mode == AnimationModes.STATIC_STANDBY:
             self.animation_mode = AnimationModes.STATIC
         self._do_update()
+

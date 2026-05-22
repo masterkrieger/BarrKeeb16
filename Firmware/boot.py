@@ -1,6 +1,17 @@
-import supervisor
-from keeb_display import DisplayLayers
+import storage
+import board
+import digitalio
 
-supervisor.set_next_stack_limit(4096 + 4096)
+switch = digitalio.DigitalInOut(board.A2)
+switch.direction = digitalio.Direction.INPUT
+switch.pull = digitalio.Pull.UP
+print(switch.value)
 
-DisplayLayers.display_splash_fox()
+# Normal operation: USB drive hidden, switch.value is True (A2 floating/pulled up)
+# For editing: ground A2 pin to expose USB drive to PC
+# TODO: uncomment storage.disable_usb_drive() when done editing
+if switch.value:
+    storage.disable_usb_drive()
+else:
+    pass # editing mode, USB drive stays visible
+    
